@@ -4,20 +4,22 @@ Authors
   * Samuele Cornell 2020
   * Aku Rouhe 2020
 """
+
 import ast
-import torch
 import collections
 import itertools
-import logging
-import warnings
+
+import torch
+
 import speechbrain as sb
 from speechbrain.utils.checkpoints import (
-    mark_as_saver,
     mark_as_loader,
+    mark_as_saver,
     register_checkpoint_hooks,
 )
+from speechbrain.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # NOTE: Changing these does NOT change the defaults in the classes.
 # Consider these read-only.
@@ -386,7 +388,7 @@ class CategoricalEncoder:
 
         Arguments
         ---------
-        label : hashable, optional
+        unk_label : hashable, optional
             Most often labels are str, but anything that can act as dict key is
             supported. Note that default save/load only supports Python
             literals. Default: <unk>. This can be None, as well!
@@ -474,6 +476,10 @@ class CategoricalEncoder:
         ---------
         label : hashable
             Label to encode, must exist in the mapping.
+        allow_unk : bool
+            If given, that label is not in the label set
+            AND unk_label has been added with add_unk(),
+            allows encoding to unk_label's index.
 
         Returns
         -------
@@ -488,8 +494,12 @@ class CategoricalEncoder:
 
         Arguments
         ---------
-        x : iterable
+        sequence : iterable
             Labels to encode, must exist in the mapping.
+        allow_unk : bool
+            If given, that label is not in the label set
+            AND unk_label has been added with add_unk(),
+            allows encoding to unk_label's index.
 
         Returns
         -------
@@ -504,8 +514,12 @@ class CategoricalEncoder:
 
         Arguments
         ---------
-        x : iterable
+        sequence : iterable
             Labels to encode, must exist in the mapping.
+        allow_unk : bool
+            If given, that label is not in the label set
+            AND unk_label has been added with add_unk(),
+            allows encoding to unk_label's index.
 
         Returns
         -------
@@ -613,13 +627,15 @@ class CategoricalEncoder:
         logger.debug(f"Loaded categorical encoding from {path}")
 
     @mark_as_loader
-    def load_if_possible(self, path, end_of_epoch=False, device=None):
+    def load_if_possible(self, path, end_of_epoch=False):
         """Loads if possible, returns a bool indicating if loaded or not.
 
         Arguments
         ---------
         path : str, Path
             Where to load from.
+        end_of_epoch : bool
+            Whether the checkpoint was end-of-epoch or not.
 
         Returns
         -------
@@ -644,7 +660,6 @@ class CategoricalEncoder:
         ['a', 'b', 'c', 'd']
         """
         del end_of_epoch  # Unused here.
-        del device  # Unused here.
 
         try:
             self.load(path)
@@ -719,7 +734,7 @@ class CategoricalEncoder:
                     f"but {real_len} categories found"
                 )
         else:
-            warnings.warn(
+            logger.warning_once(
                 f"{self.__class__.__name__}.expect_len was never called: "
                 f"assuming category count of {len(self)} to be correct! "
                 "Sanity check your encoder using `.expect_len`. "
@@ -751,7 +766,7 @@ class CategoricalEncoder:
     @staticmethod
     def _save_literal(path, lab2ind, extras):
         """Save which is compatible with _load_literal"""
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             for label, ind in lab2ind.items():
                 f.write(
                     repr(label)
@@ -778,7 +793,7 @@ class CategoricalEncoder:
         lab2ind = {}
         ind2lab = {}
         extras = {}
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             # Load the label to index mapping (until EXTRAS_SEPARATOR)
             for line in f:
                 if line == CategoricalEncoder.EXTRAS_SEPARATOR:
@@ -904,7 +919,9 @@ class TextEncoder(CategoricalEncoder):
         )
 
     def add_bos_eos(
-        self, bos_label=DEFAULT_BOS, eos_label=DEFAULT_EOS,
+        self,
+        bos_label=DEFAULT_BOS,
+        eos_label=DEFAULT_EOS,
     ):
         """Add sentence boundary markers in the label set.
 
@@ -955,7 +972,7 @@ class TextEncoder(CategoricalEncoder):
             bos_label, will just use one sentence-boundary label.
         bos_index : int
             Where to insert bos_label. eos_index = bos_index + 1
-        bos_index : optional, int
+        eos_index : optional, int
             Where to insert eos_label. Default: eos_index = bos_index + 1
         """
         if bos_label == eos_label:
@@ -1172,3 +1189,25 @@ class CTCTextEncoder(TextEncoder):
         super()._set_extras(extras)
         if "blank_label" in extras:
             self.blank_label = extras["blank_label"]
+
+
+def load_text_encoder_tokens(model_path):
+    """Loads the encoder tokens from a pretrained model.
+
+    This method is useful when you used with a pretrained HF model.
+    It will load the tokens in the yaml and then you will be able
+    to instantiate any CTCBaseSearcher directly in the YAML file.
+
+    Arguments
+    ---------
+    model_path : str, Path
+        Path to the pretrained model.
+
+    Returns
+    -------
+    list
+        List of tokens.
+    """
+    label_encoder = TextEncoder()
+    label_encoder.load(model_path)
+    return list(label_encoder.lab2ind.keys())

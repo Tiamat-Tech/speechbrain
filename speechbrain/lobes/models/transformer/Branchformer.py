@@ -9,13 +9,15 @@ Authors
 * Titouan Parcollet 2023
 """
 
-import torch
-import torch.nn as nn
 from typing import Optional
 
-from speechbrain.nnet.attention import RelPosMHAXL, MultiheadAttention
-from speechbrain.nnet.normalization import LayerNorm
+import torch
+import torch.nn as nn
+
 from speechbrain.lobes.models.convolution import ConvolutionalSpatialGatingUnit
+from speechbrain.nnet.attention import MultiheadAttention, RelPosMHAXL
+from speechbrain.nnet.hypermixing import HyperMixing
+from speechbrain.nnet.normalization import LayerNorm
 
 
 class ConvolutionBranch(nn.Module):
@@ -25,7 +27,7 @@ class ConvolutionBranch(nn.Module):
     LN -> Channel Proj -> GeLU -> (CNN Spatial Gating) -> Channel Proj -> Dropout
 
     Arguments
-    ----------
+    ---------
     input_size : int
         The expected size of the feature (channel) dimension.
     linear_units: int, optional
@@ -91,7 +93,7 @@ class BranchformerEncoderLayer(nn.Module):
     """This is an implementation of Branchformer encoder layer.
 
     Arguments
-    ----------
+    ---------
     d_model : int
         The expected size of the input embedding.
     nhead : int
@@ -107,7 +109,7 @@ class BranchformerEncoderLayer(nn.Module):
     dropout : int, optional
         Dropout for the encoder.
     attention_type: str, optional
-        type of attention layer, e.g. regulaMHA for regular MultiHeadAttention.
+        type of attention layer, e.g. regularMHA for regular MultiHeadAttention.
     csgu_linear_units: int, optional
         Number of neurons in the hidden linear units of the CSGU Module.
     gate_activation: torch.nn.Module, optional
@@ -157,6 +159,14 @@ class BranchformerEncoderLayer(nn.Module):
                 embed_dim=d_model,
                 dropout=dropout,
                 mask_pos_future=False,
+            )
+        elif attention_type == "hypermixing":
+            self.mha_layer = HyperMixing(
+                input_output_dim=d_model,
+                hypernet_size=d_model * 4,
+                tied=False,
+                num_heads=nhead,
+                fix_tm_hidden_size=False,
             )
 
         self.convolution_branch = ConvolutionBranch(
@@ -246,13 +256,17 @@ class BranchformerEncoder(nn.Module):
     dropout : int, optional
         Dropout for the encoder.
     attention_type: str, optional
-        type of attention layer, e.g. regulaMHA for regular MultiHeadAttention.
+        type of attention layer, e.g. regularMHA for regular MultiHeadAttention.
     csgu_linear_units: int, optional
         Number of neurons in the hidden linear units of the CSGU Module.
     gate_activation: torch.nn.Module, optional
          Activation function used at the gate of the CSGU module.
     use_linear_after_conv: bool, optional
         If True, will apply a linear transformation of size input_size//2.
+    output_hidden_states: bool, optional
+        Whether the model should output the hidden states as a list of tensor.
+    layerdrop_prob: float
+        The probability to drop an entire layer.
 
 
     Example
@@ -264,6 +278,16 @@ class BranchformerEncoder(nn.Module):
     >>> output, _ = net(x, pos_embs=pos_emb)
     >>> output.shape
     torch.Size([8, 60, 512])
+
+    >>> import torch
+    >>> x = torch.rand((8, 60, 512))
+    >>> pos_emb = torch.rand((1, 2*60-1, 512))
+    >>> net = BranchformerEncoder(1, 512, 8, output_hidden_states=True)
+    >>> output, attn_list, hidden_list = net(x, pos_embs=pos_emb)
+    >>> hidden_list[0].shape
+    torch.Size([8, 60, 512])
+    >>> len(hidden_list)
+    2
     """
 
     def __init__(
@@ -280,6 +304,8 @@ class BranchformerEncoder(nn.Module):
         csgu_linear_units=3072,
         gate_activation=nn.Identity,
         use_linear_after_conv=False,
+        output_hidden_states=False,
+        layerdrop_prob=0.0,
     ):
         super().__init__()
 
@@ -302,7 +328,9 @@ class BranchformerEncoder(nn.Module):
             ]
         )
         self.norm = LayerNorm(d_model, eps=1e-6)
+        self.layerdrop_prob = layerdrop_prob
         self.attention_type = attention_type
+        self.output_hidden_states = output_hidden_states
 
     def forward(
         self,
@@ -310,10 +338,11 @@ class BranchformerEncoder(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         pos_embs: Optional[torch.Tensor] = None,
+        dynchunktrain_config=None,
     ):
         """
         Arguments
-        ----------
+        ---------
         src : torch.Tensor
             The sequence to the encoder layer.
         src_mask : torch.Tensor, optional
@@ -324,7 +353,22 @@ class BranchformerEncoder(nn.Module):
             Module or tensor containing the input sequence positional embeddings
             If custom pos_embs are given it needs to have the shape (1, 2*S-1, E)
             where S is the sequence length, and E is the embedding dimension.
+        dynchunktrain_config : None
+            This configuration is unsupported for this encoder.
+
+        Returns
+        -------
+        output : torch.Tensor
+            The output of the Conformer.
+        attention_lst : list
+            The attention values.
+        hidden_state_lst : list, optional
+            The output of the hidden layers of the encoder.
+            Only works if output_hidden_states is set to true.
         """
+        assert (
+            dynchunktrain_config is None
+        ), "Dynamic Chunk Training unsupported for this encoder"
 
         if self.attention_type == "RelPosMHAXL":
             if pos_embs is None:
@@ -333,15 +377,33 @@ class BranchformerEncoder(nn.Module):
                 )
 
         output = src
+
+        if self.layerdrop_prob > 0.0:
+            keep_probs = torch.rand(len(self.layers))
+
         attention_lst = []
-        for enc_layer in self.layers:
-            output, attention = enc_layer(
-                output,
-                src_mask=src_mask,
-                src_key_padding_mask=src_key_padding_mask,
-                pos_embs=pos_embs,
-            )
-            attention_lst.append(attention)
+        if self.output_hidden_states:
+            hidden_state_lst = [output]
+
+        for i, enc_layer in enumerate(self.layers):
+            if (
+                not self.training
+                or self.layerdrop_prob == 0.0
+                or keep_probs[i] > self.layerdrop_prob
+            ):
+                output, attention = enc_layer(
+                    output,
+                    src_mask=src_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    pos_embs=pos_embs,
+                )
+                attention_lst.append(attention)
+
+                if self.output_hidden_states:
+                    hidden_state_lst.append(output)
+
         output = self.norm(output)
 
+        if self.output_hidden_states:
+            return output, attention_lst, hidden_state_lst
         return output, attention_lst
