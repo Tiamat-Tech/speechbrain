@@ -17,7 +17,10 @@ from speechbrain.lobes.models.transformer.Transformer import (
     get_key_padding_mask,
     get_lookahead_mask,
 )
-from speechbrain.lobes.models.transformer.TransformerASR import TransformerASR, make_transformer_src_tgt_masks
+from speechbrain.lobes.models.transformer.TransformerASR import (
+    TransformerASR,
+    make_transformer_src_tgt_masks,
+)
 from speechbrain.nnet.activations import Swish
 from speechbrain.nnet.containers import ModuleList
 from speechbrain.utils.logger import get_logger
